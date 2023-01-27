@@ -2,17 +2,27 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/signal"
+	"strconv"
 
+	ot2sss "github.com/Jigsaw-Code/outline-go-tun2socks/outline/shadowsocks"
+	ot2s "github.com/Jigsaw-Code/outline-go-tun2socks/shadowsocks"
+	t2score "github.com/eycorsican/go-tun2socks/core"
+	"github.com/eycorsican/go-tun2socks/proxy/dnsfallback"
 	"github.com/songgao/water"
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 )
 
+// Compile with `go build -ldflags="-extldflags=-static"` on Linux
+// We only support Linux for now
+
 const OUTLINE_TUN_NAME = "outline233"
 const OUTLINE_TUN_IP = "10.233.233.1"
+const OUTLINE_TUN_MTU = 1500 // todo: we can read this from netlink
 const OUTLINE_TUN_SUBNET = "10.233.233.1/32"
 const OUTLINE_GW_SUBNET = "10.233.233.2/32"
 const OUTLINE_GW_IP = "10.233.233.2"
@@ -21,12 +31,24 @@ const OUTLINE_ROUTING_TABLE = 233
 
 // ./app
 //
-//	<svr-ip>     : the outline server IP (e.g. 111.111.111.111/32)
+//	<svr-ip>     : the outline server IP (e.g. 111.111.111.111)
+//	<svt-port>   : the outline server port (e.g. 21532)
 //	<svr-pass>   : the outline server password
 func main() {
-	fmt.Println("OutlineVPN CLI (experimental-01271722)")
+	fmt.Println("OutlineVPN CLI (experimental-01271815)")
 
 	svrIp := os.Args[1]
+	svrIpCidr := svrIp + "/32"
+	svrPass := os.Args[3]
+	svrPort, err := strconv.Atoi(os.Args[2])
+	if err != nil {
+		fmt.Printf("fatal error: %v\n", err)
+		return
+	}
+	if svrPort < 1000 || svrPort > 65535 {
+		fmt.Printf("fatal error: server port out of range\n")
+		return
+	}
 
 	tun, err := setupTunDevice()
 	if err != nil {
@@ -54,7 +76,7 @@ func main() {
 		return
 	}
 
-	r, err := setupIpRule(svrIp)
+	r, err := setupIpRule(svrIpCidr)
 	if err != nil {
 		return
 	}
@@ -64,9 +86,11 @@ func main() {
 		return
 	}
 
-	if err := startTun2Socks(); err != nil {
+	lwip, err := startTun2Socks(tun, svrIp, svrPass, svrPort)
+	if err != nil {
 		return
 	}
+	defer stopTun2Socks(lwip)
 
 	sigc := make(chan os.Signal, 1)
 	signal.Notify(sigc, os.Interrupt, os.Kill, unix.SIGTERM, unix.SIGHUP)
@@ -275,6 +299,44 @@ func cleanUpRule(rule *netlink.Rule) error {
 	return nil
 }
 
-func startTun2Socks() error {
-	return fmt.Errorf("not implemented yet")
+func startTun2Socks(tun *water.Interface, ip, pass string, port int) (*t2score.LWIPStack, error) {
+	fmt.Println("starting outline-go-tun2socks...")
+	config := ot2sss.Config{
+		Host:       ip,
+		Port:       port,
+		Password:   pass,
+		CipherName: "chacha20-ietf-poly1305",
+		Prefix:     make([]byte, 0),
+	}
+	client, err := ot2sss.NewClient(&config)
+	if err != nil {
+		fmt.Printf("fatal error: %v\n", err)
+		return nil, err
+	}
+
+	t2score.RegisterOutputFn(tun.Write)
+	t2score.RegisterTCPConnHandler(ot2s.NewTCPHandler(client))
+	t2score.RegisterUDPConnHandler(dnsfallback.NewUDPHandler())
+
+	lwip := t2score.NewLWIPStack()
+	go func() {
+		fmt.Printf("debug: received some data from tun %v\n", tun.Name())
+		_, err := io.CopyBuffer(lwip, tun, make([]byte, OUTLINE_TUN_MTU))
+		if err != nil {
+			fmt.Printf("error: failed to write data to network stack: %v\n", err)
+		}
+	}()
+
+	fmt.Println("outline-go-tun2socks started")
+	return &lwip, nil
+}
+
+func stopTun2Socks(lwip *t2score.LWIPStack) error {
+	fmt.Println("stopping outline-go-tun2socks...")
+	err := (*lwip).Close()
+	if err != nil {
+		fmt.Printf("fatal error: %v\n", err)
+	}
+	fmt.Println("outline-go-tun2socks stopped")
+	return err
 }
