@@ -5,7 +5,6 @@ import (
 	"net"
 	"os"
 	"os/signal"
-	"strconv"
 
 	"github.com/songgao/water"
 	"github.com/vishvananda/netlink"
@@ -17,15 +16,17 @@ const OUTLINE_TUN_IP = "10.233.233.1"
 const OUTLINE_TUN_SUBNET = "10.233.233.1/32"
 const OUTLINE_GW_SUBNET = "10.233.233.2/32"
 const OUTLINE_GW_IP = "10.233.233.2"
+const OUTLINE_ROUTING_PRIORITY = 23333
 const OUTLINE_ROUTING_TABLE = 233
 
 // ./app
 //
-//		<def-gw-ip>  : the default public gateway (e.g. 192.168.1.1)
-//		<eth-index>  : the ethernet card index (e.g. 2)
-//	    <svr-ip>     : the outline server IP (e.g. 111.111.111.111/32)
+//	<svr-ip>     : the outline server IP (e.g. 111.111.111.111/32)
+//	<svr-pass>   : the outline server password
 func main() {
-	fmt.Println("OutlineVPN CLI")
+	fmt.Println("OutlineVPN CLI (experimental-01271722)")
+
+	svrIp := os.Args[1]
 
 	tun, err := setupTunDevice()
 	if err != nil {
@@ -43,17 +44,27 @@ func main() {
 		return
 	}
 
-	ethIndex, err := strconv.Atoi(os.Args[2])
-	if err != nil {
-		fmt.Printf("faltal error: %v\n", err)
-	}
-	err = setupRouting(ethIndex, os.Args[1], os.Args[3])
+	err = setupRouting()
 	if err != nil {
 		return
 	}
 	defer cleanUpRouting()
 
 	if err := showRouting(); err != nil {
+		return
+	}
+
+	r, err := setupIpRule(svrIp)
+	if err != nil {
+		return
+	}
+	defer cleanUpRule(r)
+
+	if err := showAllRules(); err != nil {
+		return
+	}
+
+	if err := startTun2Socks(); err != nil {
 		return
 	}
 
@@ -154,7 +165,7 @@ func showRouting() error {
 	return nil
 }
 
-func setupRouting(eth int, gwIp, svrIp string) error {
+func setupRouting() error {
 	fmt.Println("configuring outline routing table...")
 	tun, err := netlink.LinkByName(OUTLINE_TUN_NAME)
 	if err != nil {
@@ -175,24 +186,6 @@ func setupRouting(eth int, gwIp, svrIp string) error {
 		Scope:     netlink.SCOPE_LINK,
 	}
 	fmt.Printf("\trouting only from %v to %v through nic %v...\n", r.Src, r.Dst, r.LinkIndex)
-	err = netlink.RouteAdd(&r)
-	if err != nil {
-		fmt.Printf("fatal error: %v\n", err)
-		return err
-	}
-
-	dst, err = netlink.ParseIPNet(svrIp)
-	if err != nil {
-		fmt.Printf("fatal error: %v\n", err)
-		return err
-	}
-	r = netlink.Route{
-		LinkIndex: eth,
-		Table:     OUTLINE_ROUTING_TABLE,
-		Dst:       dst,
-		Gw:        net.ParseIP(gwIp),
-	}
-	fmt.Printf("\trouting all to %v via gw %v through nic %v...\n", r.Dst, r.Gw, r.LinkIndex)
 	err = netlink.RouteAdd(&r)
 	if err != nil {
 		fmt.Printf("fatal error: %v\n", err)
@@ -234,4 +227,54 @@ func cleanUpRouting() error {
 		fmt.Println("routing table has been reset")
 	}
 	return lastErr
+}
+
+func showAllRules() error {
+	rules, err := netlink.RuleList(netlink.FAMILY_ALL)
+	if err != nil {
+		fmt.Printf("fatal error: %v\n", err)
+		return err
+	}
+	for _, r := range rules {
+		fmt.Printf("\t%v\n", r)
+	}
+	return nil
+}
+
+func setupIpRule(svrIp string) (*netlink.Rule, error) {
+	fmt.Println("adding ip rule for outline routing table...")
+	dst, err := netlink.ParseIPNet(svrIp)
+	if err != nil {
+		fmt.Printf("fatal error: %v\n", err)
+		return nil, err
+	}
+	rule := netlink.NewRule()
+	rule.Priority = OUTLINE_ROUTING_PRIORITY
+	rule.Family = netlink.FAMILY_V4
+	rule.Table = OUTLINE_ROUTING_TABLE
+	rule.Dst = dst
+	rule.Invert = true
+	fmt.Printf("+from all not to %v via table %v...\n", rule.Dst, rule.Table)
+	err = netlink.RuleAdd(rule)
+	if err != nil {
+		fmt.Printf("fatal error: %v\n", err)
+		return nil, err
+	}
+	fmt.Println("ip rule for outline routing table created")
+	return rule, nil
+}
+
+func cleanUpRule(rule *netlink.Rule) error {
+	fmt.Println("cleaning up ip rule of routing table...")
+	err := netlink.RuleDel(rule)
+	if err != nil {
+		fmt.Printf("fatal error: %v\n", err)
+		return err
+	}
+	fmt.Println("ip rule of routing table deleted")
+	return nil
+}
+
+func startTun2Socks() error {
+	return fmt.Errorf("not implemented yet")
 }
